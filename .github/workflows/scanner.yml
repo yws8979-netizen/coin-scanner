@@ -20,7 +20,7 @@ jobs:
           python-version: "3.11"
 
       - run: |
-          pip install ccxt pandas numpy requests
+          pip install pandas numpy requests
 
       - run: python scanner.py
         env:
