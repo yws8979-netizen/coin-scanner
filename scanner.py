@@ -1,26 +1,20 @@
 import os
 import time
 import requests
-import ccxt
 import pandas as pd
 import numpy as np
 from datetime import datetime
 
 TIMEFRAME = "3m"
-OHLCV_LIMIT = 120
-TOP_VOLUME_FILTER = 80
-TOP_N_ALERTS = 10
+LIMIT = 120
 
-LONG_THRESHOLD = 70
-SHORT_THRESHOLD = 70
+TOP_SYMBOLS = 80
+
+LONG_SCORE = 70
+SHORT_SCORE = 70
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-
-exchange = ccxt.binance({
-    "enableRateLimit": True,
-    "options": {"defaultType": "future"}
-})
 
 session = requests.Session()
 
@@ -35,7 +29,9 @@ def send_telegram(msg):
         print(msg)
         return
 
-    url = "https://api.telegram.org/bot{}/sendMessage".format(TELEGRAM_BOT_TOKEN)
+    url = "https://api.telegram.org/bot{}/sendMessage".format(
+        TELEGRAM_BOT_TOKEN
+    )
 
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -49,35 +45,63 @@ def send_telegram(msg):
         pass
 
 
+# =========================
+# 심볼 조회
+# =========================
+
 def get_symbols():
 
-    markets = exchange.load_markets()
+    url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 
-    result = []
+    data = requests.get(url).json()
 
-    for sym, m in markets.items():
+    symbols = []
 
-        if m.get("quote") != "USDT":
+    for s in data["symbols"]:
+
+        if s["quoteAsset"] != "USDT":
             continue
 
-        if not m.get("swap"):
+        if s["contractType"] != "PERPETUAL":
             continue
 
-        result.append(sym)
+        symbols.append(s["symbol"])
 
-    return result
+    return symbols
 
+
+# =========================
+# KLINE
+# =========================
 
 def fetch_ohlcv(symbol):
 
-    data = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=OHLCV_LIMIT)
+    url = "https://fapi.binance.com/fapi/v1/klines"
 
-    df = pd.DataFrame(data, columns=[
+    params = {
+        "symbol": symbol,
+        "interval": TIMEFRAME,
+        "limit": LIMIT
+    }
+
+    data = requests.get(url, params=params).json()
+
+    df = pd.DataFrame(data)
+
+    df = df.iloc[:, 0:6]
+
+    df.columns = [
         "ts", "open", "high", "low", "close", "volume"
-    ])
+    ]
+
+    df = df.astype(float)
 
     return df
 
+
+# =========================
+# RSI
+# =========================
 
 def calc_rsi(close, period=14):
 
@@ -95,6 +119,10 @@ def calc_rsi(close, period=14):
 
     return rsi
 
+
+# =========================
+# SMI
+# =========================
 
 def calc_smi(df):
 
@@ -120,6 +148,10 @@ def calc_smi(df):
     return df
 
 
+# =========================
+# 점수 계산
+# =========================
+
 def score_symbol(symbol):
 
     try:
@@ -130,6 +162,7 @@ def score_symbol(symbol):
             return None
 
         df["rsi"] = calc_rsi(df["close"])
+
         df = calc_smi(df)
 
         rsi = df["rsi"].iloc[-1]
@@ -162,13 +195,13 @@ def score_symbol(symbol):
         price = df["close"].iloc[-1]
         price_prev = df["close"].iloc[-2]
 
-        price_chg = (price - price_prev) / price_prev * 100
+        price_change = (price - price_prev) / price_prev * 100
 
         return {
             "symbol": symbol,
             "long": score_long,
             "short": score_short,
-            "price": price_chg,
+            "price": price_change,
             "vol": vol_ratio,
             "rsi": rsi,
             "smi_k": smi_k,
@@ -179,15 +212,19 @@ def score_symbol(symbol):
         return None
 
 
-def make_long_msg(item):
+# =========================
+# 메시지
+# =========================
 
-    msg = (
-        "🚀 <b>롱 시그널</b>\n"
+def long_msg(item):
+
+    return (
+        "🚀 <b>롱 신호</b>\n"
         "⏰ {}\n\n"
         "{}\n"
         "score {}\n"
         "price {:+.2f}%\n"
-        "vol {:.2f}x\n"
+        "volume {:.2f}x\n"
         "RSI {:.1f}\n"
         "SMI {:.1f}/{:.1f}"
     ).format(
@@ -201,18 +238,16 @@ def make_long_msg(item):
         item["smi_d"]
     )
 
-    return msg
 
+def short_msg(item):
 
-def make_short_msg(item):
-
-    msg = (
-        "💥 <b>숏 시그널</b>\n"
+    return (
+        "💥 <b>숏 신호</b>\n"
         "⏰ {}\n\n"
         "{}\n"
         "score {}\n"
         "price {:+.2f}%\n"
-        "vol {:.2f}x\n"
+        "volume {:.2f}x\n"
         "RSI {:.1f}\n"
         "SMI {:.1f}/{:.1f}"
     ).format(
@@ -226,47 +261,53 @@ def make_short_msg(item):
         item["smi_d"]
     )
 
-    return msg
 
+# =========================
+# 스캔
+# =========================
 
 def scan():
 
     symbols = get_symbols()
 
-    scored = []
+    results = []
 
-    for s in symbols:
+    for s in symbols[:TOP_SYMBOLS]:
 
         item = score_symbol(s)
 
         if item:
-            scored.append(item)
+            results.append(item)
 
-        time.sleep(0.05)
+        time.sleep(0.03)
 
-    best_long = sorted(scored, key=lambda x: x["long"], reverse=True)[:TOP_N_ALERTS]
-    best_short = sorted(scored, key=lambda x: x["short"], reverse=True)[:TOP_N_ALERTS]
+    best_long = sorted(results, key=lambda x: x["long"], reverse=True)[:10]
+    best_short = sorted(results, key=lambda x: x["short"], reverse=True)[:10]
 
     for item in best_long:
 
-        if item["long"] >= LONG_THRESHOLD:
+        if item["long"] >= LONG_SCORE:
 
-            send_telegram(make_long_msg(item))
+            send_telegram(long_msg(item))
 
     for item in best_short:
 
-        if item["short"] >= SHORT_THRESHOLD:
+        if item["short"] >= SHORT_SCORE:
 
-            send_telegram(make_short_msg(item))
+            send_telegram(short_msg(item))
 
+
+# =========================
+# MAIN
+# =========================
 
 def main():
 
-    send_telegram("두식이아빠 코인탐지기 시작\n{}".format(now()))
+    send_telegram("두식이아빠 코인 레이더 시작\n{}".format(now()))
 
     scan()
 
-    print("scan complete")
+    print("scan done")
 
 
 if __name__ == "__main__":
