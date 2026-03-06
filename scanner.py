@@ -1,6 +1,5 @@
 import os
 import time
-import math
 import requests
 import ccxt
 import pandas as pd
@@ -12,7 +11,6 @@ from datetime import datetime
 # =========================
 TIMEFRAME = "3m"
 OHLCV_LIMIT = 120
-SCAN_INTERVAL_SEC = 50
 TOP_N_ALERTS = 10
 
 LONG_EARLY_THRESHOLD = 60
@@ -28,7 +26,8 @@ PRICE_EARLY_SHORT_MAX = -0.2
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# 중복 알림 방지
+# GitHub Actions는 매 실행마다 새 환경이라
+# 로컬 메모리 중복 방지는 의미가 적지만 구조 유지
 last_alert_map = {}
 
 # 바이낸스 선물
@@ -38,7 +37,8 @@ exchange = ccxt.binance({
 })
 
 session = requests.Session()
-session.headers.update({"User-Agent": "scanner-v7"})
+session.headers.update({"User-Agent": "scanner-v7-github-actions"})
+
 
 # =========================
 # 유틸
@@ -72,6 +72,7 @@ def send_telegram(text: str) -> None:
     try:
         resp = session.post(url, data=payload, timeout=10)
         resp.raise_for_status()
+        print("[텔레그램 전송 성공]")
     except Exception as e:
         print(f"[텔레그램 전송 실패] {e}")
 
@@ -107,7 +108,6 @@ def fetch_ohlcv(symbol: str, timeframe: str = TIMEFRAME, limit: int = OHLCV_LIMI
 
 
 def fetch_open_interest_history(symbol: str, period: str = "5m", limit: int = 4) -> list[float]:
-    # Binance Futures Open Interest Hist
     url = "https://fapi.binance.com/futures/data/openInterestHist"
     params = {
         "symbol": binance_symbol(symbol),
@@ -119,14 +119,11 @@ def fetch_open_interest_history(symbol: str, period: str = "5m", limit: int = 4)
     data = r.json()
     result = []
     for row in data:
-        # sumOpenInterestValue / sumOpenInterest 둘 중 사용 가능
-        # 여기서는 계약 수량 성격의 sumOpenInterest 사용
         result.append(safe_float(row.get("sumOpenInterest")))
     return result
 
 
 def fetch_taker_ratio(symbol: str, period: str = "5m", limit: int = 4) -> list[dict]:
-    # Binance Futures Taker long/short ratio
     url = "https://fapi.binance.com/futures/data/takerlongshortRatio"
     params = {
         "symbol": binance_symbol(symbol),
@@ -202,7 +199,6 @@ def pct_change(a: float, b: float) -> float:
 
 
 def oi_acceleration(oi_vals: list[float]) -> tuple[bool, float]:
-    # 최소 4개 필요
     if len(oi_vals) < 4:
         return False, 0.0
 
@@ -338,7 +334,6 @@ def score_symbol(symbol: str) -> dict | None:
     short_early = 0
     short_confirm = 0
 
-    # LONG EARLY
     if oi_accel:
         long_early += 15
     if vol_accel:
@@ -356,7 +351,6 @@ def score_symbol(symbol: str) -> dict | None:
     if low_wick:
         long_early += 5
 
-    # LONG CONFIRM
     if up_break:
         long_confirm += 20
     if taker_long:
@@ -372,7 +366,6 @@ def score_symbol(symbol: str) -> dict | None:
     if 0.5 <= price_chg <= 2.8:
         long_confirm += 10
 
-    # SHORT EARLY
     if oi_accel:
         short_early += 15
     if vol_accel:
@@ -390,7 +383,6 @@ def score_symbol(symbol: str) -> dict | None:
     if up_wick:
         short_early += 10
 
-    # SHORT CONFIRM
     if down_break:
         short_confirm += 20
     if taker_short:
@@ -441,6 +433,16 @@ def make_alert_text(kind: str, item: dict) -> str:
     vol_ratio = item["vol_ratio"]
     taker_delta = item["taker_delta"]
 
+    tight_line = "range tight\n" if item["tight"] else ""
+    low_wick_line = "lower wick reject\n" if item["low_wick"] else ""
+    up_wick_line = "upper wick reject\n" if item["up_wick"] else ""
+    up_break_line = "upper break yes\n" if item["up_break"] else ""
+    down_break_line = "lower break yes\n" if item["down_break"] else ""
+    oi_line = "(속도↑↑)" if item["oi_accel"] else ""
+    oi_line_early = "(속도↑)" if item["oi_accel"] else ""
+    vol_line = "(가속↑↑)" if item["vol_accel"] else ""
+    vol_line_early = "(가속↑)" if item["vol_accel"] else ""
+
     if kind == "LONG_EARLY":
         return (
             f"🛰 <b>롱 예고</b>\n"
@@ -448,12 +450,12 @@ def make_alert_text(kind: str, item: dict) -> str:
             f"<b>{symbol}</b>\n"
             f"L-early {item['long_early']}\n"
             f"price {price:+.2f}%\n"
-            f"OI {oi_pct:+.2f}% {'(속도↑)' if item['oi_accel'] else ''}\n"
-            f"vol {vol_ratio:.2f}x {'(가속↑)' if item['vol_accel'] else ''}\n"
+            f"OI {oi_pct:+.2f}% {oi_line_early}\n"
+            f"vol {vol_ratio:.2f}x {vol_line_early}\n"
             f"takerΔ {taker_delta:+.2f}\n"
             f"RSI {item['rsi']:.1f} | SMI {item['smi_k']:.1f}/{item['smi_d']:.1f}\n"
-            f"{'range tight\n' if item['tight'] else ''}"
-            f"{'lower wick reject\n' if item['low_wick'] else ''}"
+            f"{tight_line}"
+            f"{low_wick_line}"
         ).strip()
 
     if kind == "LONG_CONFIRM":
@@ -463,10 +465,10 @@ def make_alert_text(kind: str, item: dict) -> str:
             f"<b>{symbol}</b>\n"
             f"L-confirm {item['long_confirm']}\n"
             f"price {price:+.2f}%\n"
-            f"OI {oi_pct:+.2f}% {'(속도↑↑)' if item['oi_accel'] else ''}\n"
-            f"vol {vol_ratio:.2f}x {'(가속↑↑)' if item['vol_accel'] else ''}\n"
+            f"OI {oi_pct:+.2f}% {oi_line}\n"
+            f"vol {vol_ratio:.2f}x {vol_line}\n"
             f"takerΔ {taker_delta:+.2f}\n"
-            f"{'upper break yes\n' if item['up_break'] else ''}"
+            f"{up_break_line}"
         ).strip()
 
     if kind == "SHORT_EARLY":
@@ -476,12 +478,12 @@ def make_alert_text(kind: str, item: dict) -> str:
             f"<b>{symbol}</b>\n"
             f"S-early {item['short_early']}\n"
             f"price {price:+.2f}%\n"
-            f"OI {oi_pct:+.2f}% {'(속도↑)' if item['oi_accel'] else ''}\n"
-            f"vol {vol_ratio:.2f}x {'(가속↑)' if item['vol_accel'] else ''}\n"
+            f"OI {oi_pct:+.2f}% {oi_line_early}\n"
+            f"vol {vol_ratio:.2f}x {vol_line_early}\n"
             f"takerΔ {taker_delta:+.2f}\n"
             f"RSI {item['rsi']:.1f} | SMI {item['smi_k']:.1f}/{item['smi_d']:.1f}\n"
-            f"{'range tight\n' if item['tight'] else ''}"
-            f"{'upper wick reject\n' if item['up_wick'] else ''}"
+            f"{tight_line}"
+            f"{up_wick_line}"
         ).strip()
 
     return (
@@ -490,10 +492,10 @@ def make_alert_text(kind: str, item: dict) -> str:
         f"<b>{symbol}</b>\n"
         f"S-confirm {item['short_confirm']}\n"
         f"price {price:+.2f}%\n"
-        f"OI {oi_pct:+.2f}% {'(속도↑↑)' if item['oi_accel'] else ''}\n"
-        f"vol {vol_ratio:.2f}x {'(가속↑↑)' if item['vol_accel'] else ''}\n"
+        f"OI {oi_pct:+.2f}% {oi_line}\n"
+        f"vol {vol_ratio:.2f}x {vol_line}\n"
         f"takerΔ {taker_delta:+.2f}\n"
-        f"{'lower break yes\n' if item['down_break'] else ''}"
+        f"{down_break_line}"
     ).strip()
 
 
@@ -525,11 +527,9 @@ def scan_once(symbols: list[str]) -> None:
         print("[스캔 결과 없음]")
         return
 
-    # 상위 후보 정렬
     best_long = sorted(scored, key=lambda x: (x["long_confirm"], x["long_early"]), reverse=True)[:TOP_N_ALERTS]
     best_short = sorted(scored, key=lambda x: (x["short_confirm"], x["short_early"]), reverse=True)[:TOP_N_ALERTS]
 
-    # LONG
     for item in best_long:
         symbol = item["symbol"]
 
@@ -543,7 +543,6 @@ def scan_once(symbols: list[str]) -> None:
             if should_send_alert(key, cooldown_sec=1200):
                 send_telegram(make_alert_text("LONG_EARLY", item))
 
-    # SHORT
     for item in best_short:
         symbol = item["symbol"]
 
@@ -570,18 +569,9 @@ def main() -> None:
         f"symbols: {len(symbols)}"
     )
 
-    while True:
-        started = time.time()
-        print(f"\n[스캔 시작] {now_str()}")
-        try:
-            scan_once(symbols)
-        except Exception as e:
-            print(f"[치명 오류] {e}")
-
-        elapsed = time.time() - started
-        sleep_sec = max(5, SCAN_INTERVAL_SEC - int(elapsed))
-        print(f"[스캔 종료] 소요 {elapsed:.1f}s / 다음 스캔 {sleep_sec}s 후")
-        time.sleep(sleep_sec)
+    print(f"\n[스캔 시작] {now_str()}")
+    scan_once(symbols)
+    print(f"[스캔 종료] {now_str()}")
 
 
 if __name__ == "__main__":
