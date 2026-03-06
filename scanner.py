@@ -1,230 +1,588 @@
-import os, time
+import os
+import time
+import math
 import requests
+import ccxt
+import pandas as pd
+import numpy as np
 from datetime import datetime
 
-BINANCE_FAPI = "https://fapi.binance.com"
-TELEGRAM_API = "https://api.telegram.org"
+# =========================
+# 기본 설정
+# =========================
+TIMEFRAME = "3m"
+OHLCV_LIMIT = 120
+SCAN_INTERVAL_SEC = 50
+TOP_N_ALERTS = 10
 
-BOT_TOKEN = os.getenv("T8664391200:AAGpet1y3CNiK1wp1RQQoWHnik4VsIcFUQU")
-CHAT_ID   = os.getenv("T8013667300")
+LONG_EARLY_THRESHOLD = 60
+SHORT_EARLY_THRESHOLD = 60
+LONG_CONFIRM_THRESHOLD = 72
+SHORT_CONFIRM_THRESHOLD = 72
 
-QUOTE = "USDT"
-SCAN_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC", "180"))
-TOP_N = int(os.getenv("TOP_N", "10"))
+PRICE_EARLY_LONG_MIN = 0.2
+PRICE_EARLY_LONG_MAX = 1.8
+PRICE_EARLY_SHORT_MIN = -1.8
+PRICE_EARLY_SHORT_MAX = -0.2
 
-MIN_QUOTE_VOL_15M = float(os.getenv("MIN_QUOTE_VOL_15M", "300000"))
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-FUNDING_SOFT_MAX = float(os.getenv("FUNDING_SOFT_MAX", "0.00012"))
-FUNDING_HARD_MAX = float(os.getenv("FUNDING_HARD_MAX", "0.00025"))
+# 중복 알림 방지
+last_alert_map = {}
 
-W_PRICE_DROP = 22
-W_OI_RISE = 22
-W_OI_PER_DROP = 18
-W_TAKER_RECOVER = 18
-W_SHORT_BIAS = 10
-W_FUNDING = 10
+# 바이낸스 선물
+exchange = ccxt.binance({
+    "enableRateLimit": True,
+    "options": {"defaultType": "future"},
+})
 
-def http_get(url, params=None, timeout=10):
-    r = requests.get(url, params=params, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
+session = requests.Session()
+session.headers.update({"User-Agent": "scanner-v7"})
 
-def tg_send(text: str):
-    if not BOT_TOKEN or not CHAT_ID:
-        print("[WARN] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set.\n")
+# =========================
+# 유틸
+# =========================
+def now_str() -> str:
+    return datetime.now().strftime("%m-%d %H:%M:%S")
+
+
+def safe_float(value, default=0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def send_telegram(text: str) -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[텔레그램 미설정]")
         print(text)
         return
-    url = f"{TELEGRAM_API}/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True}
-    r = requests.post(url, json=payload, timeout=10)
-    r.raise_for_status()
 
-def clamp(x, lo, hi):
-    return max(lo, min(hi, x))
-
-def pct(a, b):
-    if a == 0:
-        return 0.0
-    return (b - a) / a * 100.0
-
-def get_usdt_perp_symbols():
-    data = http_get(f"{BINANCE_FAPI}/fapi/v1/exchangeInfo")
-    syms = []
-    for s in data.get("symbols", []):
-        if s.get("quoteAsset") != QUOTE:
-            continue
-        if s.get("contractType") != "PERPETUAL":
-            continue
-        if s.get("status") != "TRADING":
-            continue
-        syms.append(s["symbol"])
-    return syms
-
-def get_klines(symbol, interval, limit):
-    return http_get(f"{BINANCE_FAPI}/fapi/v1/klines", {
-        "symbol": symbol, "interval": interval, "limit": limit
-    })
-
-def get_oi_hist(symbol, period, limit=30):
-    return http_get(f"{BINANCE_FAPI}/futures/data/openInterestHist", {
-        "symbol": symbol, "period": period, "limit": limit
-    })
-
-def get_taker_ratio(symbol, period, limit=30):
-    return http_get(f"{BINANCE_FAPI}/futures/data/takerlongshortRatio", {
-        "symbol": symbol, "period": period, "limit": limit
-    })
-
-def get_global_ls_ratio(symbol, period, limit=30):
-    return http_get(f"{BINANCE_FAPI}/futures/data/globalLongShortAccountRatio", {
-        "symbol": symbol, "period": period, "limit": limit
-    })
-
-def get_funding_rate(symbol):
-    data = http_get(f"{BINANCE_FAPI}/fapi/v1/premiumIndex", {"symbol": symbol})
-    return float(data["lastFundingRate"])
-
-def score_symbol(symbol):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
     try:
-        k15 = get_klines(symbol, "15m", 6)
-        if len(k15) < 5:
-            return None, "no_klines"
-
-        closes = [float(x[4]) for x in k15]
-        quote_vols = [float(x[7]) for x in k15]
-
-        if quote_vols[-1] < MIN_QUOTE_VOL_15M:
-            return None, "low_liquidity"
-
-        p_start_1h = closes[-5]
-        p_end = closes[-1]
-        price_chg_1h = pct(p_start_1h, p_end)
-
-        if price_chg_1h > -1.0:
-            return None, "no_drop"
-
-        oi15 = get_oi_hist(symbol, "15m", limit=10)
-        if len(oi15) < 5:
-            return None, "no_oi"
-
-        oi_vals = [float(x["sumOpenInterest"]) for x in oi15]
-        oi_start_1h = oi_vals[-5]
-        oi_end_1h = oi_vals[-1]
-        oi_chg_1h = pct(oi_start_1h, oi_end_1h)
-
-        if oi_chg_1h < 0.0:
-            return None, "oi_not_rising"
-
-        drop_abs = abs(price_chg_1h)
-        oi_per_drop = (oi_chg_1h / drop_abs) if drop_abs > 0 else 0.0
-
-        taker15 = get_taker_ratio(symbol, "15m", limit=6)
-        if len(taker15) < 3:
-            return None, "no_taker"
-
-        ratios = [float(x["buySellRatio"]) for x in taker15]
-        recent = ratios[-1]
-        prev_avg = sum(ratios[-4:-1]) / 3.0
-        taker_recover = recent - prev_avg
-
-        gls15 = get_global_ls_ratio(symbol, "15m", limit=2)
-        if len(gls15) < 1:
-            return None, "no_gls"
-
-        ls = float(gls15[-1]["longShortRatio"])
-        short_bias = (1.0 - ls)
-
-        funding = get_funding_rate(symbol)
-
-        if funding >= FUNDING_HARD_MAX:
-            return None, "funding_too_high"
-
-        price_norm = clamp((abs(price_chg_1h) - 1.0) / (8.0 - 1.0), 0.0, 1.0)
-        oi_norm = clamp(oi_chg_1h / 15.0, 0.0, 1.0)
-        opd_norm = clamp(oi_per_drop / 3.0, 0.0, 1.0)
-        tr_norm = clamp((taker_recover + 0.2) / 0.4, 0.0, 1.0)
-        sb_norm = clamp(short_bias / 0.35, 0.0, 1.0)
-        f_norm = 1.0 - clamp(funding / FUNDING_SOFT_MAX, 0.0, 1.0)
-
-        score = (
-            W_PRICE_DROP * price_norm +
-            W_OI_RISE * oi_norm +
-            W_OI_PER_DROP * opd_norm +
-            W_TAKER_RECOVER * tr_norm +
-            W_SHORT_BIAS * sb_norm +
-            W_FUNDING * f_norm
-        )
-
-        if funding > 0 and recent > 1.5:
-            score -= 5
-
-        score = round(clamp(score, 0.0, 100.0), 1)
-
-        details = {
-            "symbol": symbol,
-            "score": score,
-            "price_chg_1h": round(price_chg_1h, 2),
-            "oi_chg_1h": round(oi_chg_1h, 2),
-            "oi_per_drop": round(oi_per_drop, 2),
-            "taker_recent": round(recent, 3),
-            "taker_recover": round(taker_recover, 3),
-            "longShortRatio": round(ls, 3),
-            "funding": funding,
-            "quoteVol15m": round(quote_vols[-1], 0),
-        }
-        return score, details
-
+        resp = session.post(url, data=payload, timeout=10)
+        resp.raise_for_status()
     except Exception as e:
-        return None, f"err:{type(e).__name__}"
+        print(f"[텔레그램 전송 실패] {e}")
 
-def format_message(top_items):
-    now_kst = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    lines = []
-    lines.append(f"📡 숏스퀴즈 초입 후보 TOP{len(top_items)} (v3) — {now_kst}")
-    lines.append("조건: 1h 눌림 + OI증가 + 테이커 회복 + 숏편향/펀딩중립 가산")
-    lines.append("")
 
-    for i, d in enumerate(top_items, 1):
-        f_pct = d["funding"] * 100
-        lines.append(
-            f"{i:02d}) {d['symbol']}  점수 {d['score']}\n"
-            f"   1h가격 {d['price_chg_1h']}% | 1hOI {d['oi_chg_1h']}% | (OI/낙폭) {d['oi_per_drop']}\n"
-            f"   테이커(15m) {d['taker_recent']} (Δ{d['taker_recover']:+}) | L/S {d['longShortRatio']} | 펀딩 {f_pct:.4f}%\n"
-            f"   Vol15m {int(d['quoteVol15m']):,}"
-        )
+# =========================
+# 바이낸스 REST
+# =========================
+def binance_symbol(symbol: str) -> str:
+    # ccxt의 BTC/USDT:USDT -> BTCUSDT
+    return symbol.replace("/", "").replace(":USDT", "")
 
-    return "\n".join(lines)
 
-def main_loop():
-    syms = get_usdt_perp_symbols()
-    tg_send(
-        "✅ v3 스캐너 시작\n"
-        f"- 심볼: {len(syms)}개\n"
-        f"- 필터: quoteVol15m ≥ {int(MIN_QUOTE_VOL_15M):,} USDT\n"
-        f"- 펀딩: soft≤{FUNDING_SOFT_MAX*100:.4f}% / hard<{FUNDING_HARD_MAX*100:.4f}%"
+def get_usdt_perp_symbols() -> list[str]:
+    markets = exchange.load_markets()
+    symbols = []
+    for sym, market in markets.items():
+        if not market.get("active", True):
+            continue
+        if market.get("quote") != "USDT":
+            continue
+        if not market.get("swap", False):
+            continue
+        symbols.append(sym)
+    return sorted(symbols)
+
+
+def fetch_ohlcv(symbol: str, timeframe: str = TIMEFRAME, limit: int = OHLCV_LIMIT) -> pd.DataFrame:
+    raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df.dropna().reset_index(drop=True)
+
+
+def fetch_open_interest_history(symbol: str, period: str = "5m", limit: int = 4) -> list[float]:
+    # Binance Futures Open Interest Hist
+    url = "https://fapi.binance.com/futures/data/openInterestHist"
+    params = {
+        "symbol": binance_symbol(symbol),
+        "period": period,
+        "limit": limit,
+    }
+    r = session.get(url, params=params, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    result = []
+    for row in data:
+        # sumOpenInterestValue / sumOpenInterest 둘 중 사용 가능
+        # 여기서는 계약 수량 성격의 sumOpenInterest 사용
+        result.append(safe_float(row.get("sumOpenInterest")))
+    return result
+
+
+def fetch_taker_ratio(symbol: str, period: str = "5m", limit: int = 4) -> list[dict]:
+    # Binance Futures Taker long/short ratio
+    url = "https://fapi.binance.com/futures/data/takerlongshortRatio"
+    params = {
+        "symbol": binance_symbol(symbol),
+        "period": period,
+        "limit": limit,
+    }
+    r = session.get(url, params=params, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    parsed = []
+    for row in data:
+        parsed.append({
+            "buySellRatio": safe_float(row.get("buySellRatio")),
+            "buyVol": safe_float(row.get("buyVol")),
+            "sellVol": safe_float(row.get("sellVol")),
+        })
+    return parsed
+
+
+# =========================
+# 지표 계산
+# =========================
+def calc_rsi(close: pd.Series, length: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+
+    avg_gain = gain.ewm(alpha=1 / length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / length, adjust=False).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50)
+
+
+def calc_smi(df: pd.DataFrame, length_k: int = 10, length_d: int = 3, ema_len: int = 3) -> pd.DataFrame:
+    hh = df["high"].rolling(length_k).max()
+    ll = df["low"].rolling(length_k).min()
+    mid = (hh + ll) / 2.0
+    diff = df["close"] - mid
+    rng = hh - ll
+
+    diff_ema = diff.ewm(span=ema_len, adjust=False).mean().ewm(span=ema_len, adjust=False).mean()
+    rng_ema = rng.ewm(span=ema_len, adjust=False).mean().ewm(span=ema_len, adjust=False).mean()
+
+    smi_k = 100 * (diff_ema / (rng_ema / 2.0).replace(0, np.nan))
+    smi_d = smi_k.ewm(span=length_d, adjust=False).mean()
+
+    out = df.copy()
+    out["smi_k"] = smi_k.fillna(0)
+    out["smi_d"] = smi_d.fillna(0)
+    return out
+
+
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["rsi"] = calc_rsi(out["close"], 14)
+    out["ema7"] = out["close"].ewm(span=7, adjust=False).mean()
+    out["ema20"] = out["close"].ewm(span=20, adjust=False).mean()
+    out["range"] = out["high"] - out["low"]
+    out["body"] = (out["close"] - out["open"]).abs()
+    out = calc_smi(out)
+    return out.dropna().reset_index(drop=True)
+
+
+# =========================
+# 조건 함수
+# =========================
+def pct_change(a: float, b: float) -> float:
+    if b == 0:
+        return 0.0
+    return (a - b) / b * 100.0
+
+
+def oi_acceleration(oi_vals: list[float]) -> tuple[bool, float]:
+    # 최소 4개 필요
+    if len(oi_vals) < 4:
+        return False, 0.0
+
+    d1 = oi_vals[-1] - oi_vals[-2]
+    d2 = oi_vals[-2] - oi_vals[-3]
+    d3 = oi_vals[-3] - oi_vals[-4]
+
+    accel = d1 > d2 > d3 and d1 > 0
+    latest_pct = pct_change(oi_vals[-1], oi_vals[-2])
+    return accel, latest_pct
+
+
+def volume_acceleration(vols: np.ndarray) -> tuple[bool, float]:
+    if len(vols) < 4:
+        return False, 0.0
+
+    v1 = safe_float(vols[-1])
+    v2 = safe_float(vols[-2])
+    v3 = safe_float(vols[-3])
+
+    r1 = v1 / max(v2, 1e-9)
+    r2 = v2 / max(v3, 1e-9)
+
+    accel = r1 > r2 and r1 > 1.12 and v1 > v2 > v3
+    vol_ratio = v1 / max(np.mean(vols[-20:]), 1e-9)
+    return accel, vol_ratio
+
+
+def is_range_tight(df: pd.DataFrame) -> bool:
+    recent = df["range"].tail(5).mean()
+    base = df["range"].tail(30).mean()
+    if pd.isna(recent) or pd.isna(base) or base == 0:
+        return False
+    return recent < base * 0.72
+
+
+def upper_wick_reject(df: pd.DataFrame) -> bool:
+    row = df.iloc[-1]
+    upper = row["high"] - max(row["open"], row["close"])
+    body = abs(row["close"] - row["open"])
+    return upper > body * 1.2 and row["close"] < row["high"]
+
+
+def lower_wick_reject(df: pd.DataFrame) -> bool:
+    row = df.iloc[-1]
+    lower = min(row["open"], row["close"]) - row["low"]
+    body = abs(row["close"] - row["open"])
+    return lower > body * 1.2 and row["close"] > row["low"]
+
+
+def breakout_up(df: pd.DataFrame) -> bool:
+    prev_high = df["high"].iloc[-6:-1].max()
+    return df["close"].iloc[-1] > prev_high
+
+
+def breakout_down(df: pd.DataFrame) -> bool:
+    prev_low = df["low"].iloc[-6:-1].min()
+    return df["close"].iloc[-1] < prev_low
+
+
+def rsi_long_early(df: pd.DataFrame) -> bool:
+    r1, r2, r3 = df["rsi"].iloc[-1], df["rsi"].iloc[-2], df["rsi"].iloc[-3]
+    return (r1 > r2 > r3) and (r1 < 52)
+
+
+def rsi_short_early(df: pd.DataFrame) -> bool:
+    r1, r2, r3 = df["rsi"].iloc[-1], df["rsi"].iloc[-2], df["rsi"].iloc[-3]
+    return (r1 < r2 < r3) and (r1 > 48)
+
+
+def smi_long_early(df: pd.DataFrame) -> bool:
+    k1, k2 = df["smi_k"].iloc[-1], df["smi_k"].iloc[-2]
+    d1, d2 = df["smi_d"].iloc[-1], df["smi_d"].iloc[-2]
+    gap_now = d1 - k1
+    gap_prev = d2 - k2
+    return k1 > k2 and gap_now < gap_prev
+
+
+def smi_short_early(df: pd.DataFrame) -> bool:
+    k1, k2 = df["smi_k"].iloc[-1], df["smi_k"].iloc[-2]
+    d1, d2 = df["smi_d"].iloc[-1], df["smi_d"].iloc[-2]
+    gap_now = k1 - d1
+    gap_prev = k2 - d2
+    return k1 < k2 and gap_now < gap_prev
+
+
+def taker_delta_info(taker_rows: list[dict]) -> tuple[float, bool, bool]:
+    if len(taker_rows) < 2:
+        return 0.0, False, False
+
+    latest = taker_rows[-1]
+    prev = taker_rows[-2]
+
+    latest_delta = latest["buyVol"] - latest["sellVol"]
+    prev_delta = prev["buyVol"] - prev["sellVol"]
+
+    long_bias = latest_delta > 0 and latest_delta > prev_delta
+    short_bias = latest_delta < 0 and latest_delta < prev_delta
+
+    return latest_delta, long_bias, short_bias
+
+
+# =========================
+# 점수 계산
+# =========================
+def score_symbol(symbol: str) -> dict | None:
+    df = fetch_ohlcv(symbol)
+    if len(df) < 50:
+        return None
+
+    df = add_indicators(df)
+
+    oi_vals = fetch_open_interest_history(symbol, period="5m", limit=4)
+    taker_rows = fetch_taker_ratio(symbol, period="5m", limit=4)
+
+    oi_accel, oi_pct = oi_acceleration(oi_vals)
+    vol_accel, vol_ratio = volume_acceleration(df["volume"].values)
+    taker_delta, taker_long, taker_short = taker_delta_info(taker_rows)
+
+    price_chg = pct_change(df["close"].iloc[-1], df["close"].iloc[-2])
+    rsi_now = float(df["rsi"].iloc[-1])
+    smi_k = float(df["smi_k"].iloc[-1])
+    smi_d = float(df["smi_d"].iloc[-1])
+
+    tight = is_range_tight(df)
+    up_wick = upper_wick_reject(df)
+    low_wick = lower_wick_reject(df)
+    up_break = breakout_up(df)
+    down_break = breakout_down(df)
+
+    long_early = 0
+    long_confirm = 0
+    short_early = 0
+    short_confirm = 0
+
+    # LONG EARLY
+    if oi_accel:
+        long_early += 15
+    if vol_accel:
+        long_early += 15
+    if rsi_long_early(df):
+        long_early += 15
+    if smi_long_early(df):
+        long_early += 15
+    if tight:
+        long_early += 10
+    if PRICE_EARLY_LONG_MIN <= price_chg <= PRICE_EARLY_LONG_MAX:
+        long_early += 10
+    if oi_accel and vol_accel:
+        long_early += 10
+    if low_wick:
+        long_early += 5
+
+    # LONG CONFIRM
+    if up_break:
+        long_confirm += 20
+    if taker_long:
+        long_confirm += 20
+    if oi_accel:
+        long_confirm += 15
+    if vol_accel:
+        long_confirm += 15
+    if df["rsi"].iloc[-1] > df["rsi"].iloc[-2]:
+        long_confirm += 10
+    if smi_k > smi_d:
+        long_confirm += 10
+    if 0.5 <= price_chg <= 2.8:
+        long_confirm += 10
+
+    # SHORT EARLY
+    if oi_accel:
+        short_early += 15
+    if vol_accel:
+        short_early += 15
+    if rsi_short_early(df):
+        short_early += 15
+    if smi_short_early(df):
+        short_early += 15
+    if tight:
+        short_early += 10
+    if PRICE_EARLY_SHORT_MIN <= price_chg <= PRICE_EARLY_SHORT_MAX:
+        short_early += 10
+    if oi_accel and vol_accel:
+        short_early += 10
+    if up_wick:
+        short_early += 10
+
+    # SHORT CONFIRM
+    if down_break:
+        short_confirm += 20
+    if taker_short:
+        short_confirm += 20
+    if oi_accel:
+        short_confirm += 15
+    if vol_accel:
+        short_confirm += 15
+    if df["rsi"].iloc[-1] < df["rsi"].iloc[-2]:
+        short_confirm += 10
+    if smi_k < smi_d:
+        short_confirm += 10
+    if -2.8 <= price_chg <= -0.5:
+        short_confirm += 10
+
+    return {
+        "symbol": symbol,
+        "price_chg": price_chg,
+        "oi_pct": oi_pct,
+        "vol_ratio": vol_ratio,
+        "rsi": rsi_now,
+        "smi_k": smi_k,
+        "smi_d": smi_d,
+        "taker_delta": taker_delta,
+        "oi_accel": oi_accel,
+        "vol_accel": vol_accel,
+        "tight": tight,
+        "up_wick": up_wick,
+        "low_wick": low_wick,
+        "up_break": up_break,
+        "down_break": down_break,
+        "taker_long": taker_long,
+        "taker_short": taker_short,
+        "long_early": long_early,
+        "long_confirm": long_confirm,
+        "short_early": short_early,
+        "short_confirm": short_confirm,
+    }
+
+
+# =========================
+# 알림 포맷
+# =========================
+def make_alert_text(kind: str, item: dict) -> str:
+    symbol = item["symbol"].replace("/USDT:USDT", "").replace("/USDT", "")
+    price = item["price_chg"]
+    oi_pct = item["oi_pct"]
+    vol_ratio = item["vol_ratio"]
+    taker_delta = item["taker_delta"]
+
+    if kind == "LONG_EARLY":
+        return (
+            f"🛰 <b>롱 예고</b>\n"
+            f"⏰ {now_str()}\n\n"
+            f"<b>{symbol}</b>\n"
+            f"L-early {item['long_early']}\n"
+            f"price {price:+.2f}%\n"
+            f"OI {oi_pct:+.2f}% {'(속도↑)' if item['oi_accel'] else ''}\n"
+            f"vol {vol_ratio:.2f}x {'(가속↑)' if item['vol_accel'] else ''}\n"
+            f"takerΔ {taker_delta:+.2f}\n"
+            f"RSI {item['rsi']:.1f} | SMI {item['smi_k']:.1f}/{item['smi_d']:.1f}\n"
+            f"{'range tight\n' if item['tight'] else ''}"
+            f"{'lower wick reject\n' if item['low_wick'] else ''}"
+        ).strip()
+
+    if kind == "LONG_CONFIRM":
+        return (
+            f"🚀 <b>롱 발화</b>\n"
+            f"⏰ {now_str()}\n\n"
+            f"<b>{symbol}</b>\n"
+            f"L-confirm {item['long_confirm']}\n"
+            f"price {price:+.2f}%\n"
+            f"OI {oi_pct:+.2f}% {'(속도↑↑)' if item['oi_accel'] else ''}\n"
+            f"vol {vol_ratio:.2f}x {'(가속↑↑)' if item['vol_accel'] else ''}\n"
+            f"takerΔ {taker_delta:+.2f}\n"
+            f"{'upper break yes\n' if item['up_break'] else ''}"
+        ).strip()
+
+    if kind == "SHORT_EARLY":
+        return (
+            f"🛰 <b>숏 예고</b>\n"
+            f"⏰ {now_str()}\n\n"
+            f"<b>{symbol}</b>\n"
+            f"S-early {item['short_early']}\n"
+            f"price {price:+.2f}%\n"
+            f"OI {oi_pct:+.2f}% {'(속도↑)' if item['oi_accel'] else ''}\n"
+            f"vol {vol_ratio:.2f}x {'(가속↑)' if item['vol_accel'] else ''}\n"
+            f"takerΔ {taker_delta:+.2f}\n"
+            f"RSI {item['rsi']:.1f} | SMI {item['smi_k']:.1f}/{item['smi_d']:.1f}\n"
+            f"{'range tight\n' if item['tight'] else ''}"
+            f"{'upper wick reject\n' if item['up_wick'] else ''}"
+        ).strip()
+
+    return (
+        f"💥 <b>숏 발화</b>\n"
+        f"⏰ {now_str()}\n\n"
+        f"<b>{symbol}</b>\n"
+        f"S-confirm {item['short_confirm']}\n"
+        f"price {price:+.2f}%\n"
+        f"OI {oi_pct:+.2f}% {'(속도↑↑)' if item['oi_accel'] else ''}\n"
+        f"vol {vol_ratio:.2f}x {'(가속↑↑)' if item['vol_accel'] else ''}\n"
+        f"takerΔ {taker_delta:+.2f}\n"
+        f"{'lower break yes\n' if item['down_break'] else ''}"
+    ).strip()
+
+
+def should_send_alert(alert_key: str, cooldown_sec: int = 900) -> bool:
+    now_ts = time.time()
+    last_ts = last_alert_map.get(alert_key, 0)
+    if now_ts - last_ts >= cooldown_sec:
+        last_alert_map[alert_key] = now_ts
+        return True
+    return False
+
+
+# =========================
+# 실행
+# =========================
+def scan_once(symbols: list[str]) -> None:
+    scored = []
+
+    for i, symbol in enumerate(symbols, start=1):
+        try:
+            item = score_symbol(symbol)
+            if item:
+                scored.append(item)
+            time.sleep(0.08)
+        except Exception as e:
+            print(f"[에러] {symbol}: {e}")
+
+    if not scored:
+        print("[스캔 결과 없음]")
+        return
+
+    # 상위 후보 정렬
+    best_long = sorted(scored, key=lambda x: (x["long_confirm"], x["long_early"]), reverse=True)[:TOP_N_ALERTS]
+    best_short = sorted(scored, key=lambda x: (x["short_confirm"], x["short_early"]), reverse=True)[:TOP_N_ALERTS]
+
+    # LONG
+    for item in best_long:
+        symbol = item["symbol"]
+
+        if item["long_confirm"] >= LONG_CONFIRM_THRESHOLD:
+            key = f"{symbol}:LONG_CONFIRM"
+            if should_send_alert(key, cooldown_sec=900):
+                send_telegram(make_alert_text("LONG_CONFIRM", item))
+
+        elif item["long_early"] >= LONG_EARLY_THRESHOLD:
+            key = f"{symbol}:LONG_EARLY"
+            if should_send_alert(key, cooldown_sec=1200):
+                send_telegram(make_alert_text("LONG_EARLY", item))
+
+    # SHORT
+    for item in best_short:
+        symbol = item["symbol"]
+
+        if item["short_confirm"] >= SHORT_CONFIRM_THRESHOLD:
+            key = f"{symbol}:SHORT_CONFIRM"
+            if should_send_alert(key, cooldown_sec=900):
+                send_telegram(make_alert_text("SHORT_CONFIRM", item))
+
+        elif item["short_early"] >= SHORT_EARLY_THRESHOLD:
+            key = f"{symbol}:SHORT_EARLY"
+            if should_send_alert(key, cooldown_sec=1200):
+                send_telegram(make_alert_text("SHORT_EARLY", item))
+
+
+def main() -> None:
+    symbols = get_usdt_perp_symbols()
+    print(f"[시작] 심볼 수: {len(symbols)}")
+    print(f"[알림] 텔레그램 설정됨: {bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)}")
+
+    send_telegram(
+        f"✅ <b>두식이아빠 코인 탐지기 v7 시작</b>\n"
+        f"⏰ {now_str()}\n"
+        f"timeframe: {TIMEFRAME}\n"
+        f"symbols: {len(symbols)}"
     )
 
     while True:
-        t0 = time.time()
-        results = []
+        started = time.time()
+        print(f"\n[스캔 시작] {now_str()}")
+        try:
+            scan_once(symbols)
+        except Exception as e:
+            print(f"[치명 오류] {e}")
 
-        for s in syms:
-            score, payload = score_symbol(s)
-            if score is None:
-                continue
-            results.append(payload)
-
-        results.sort(key=lambda x: x["score"], reverse=True)
-        top = results[:TOP_N]
-
-        if top:
-            tg_send(format_message(top))
-        else:
-            tg_send("⚠️ 조건을 만족하는 후보가 없음")
-
-        elapsed = time.time() - t0
+        elapsed = time.time() - started
         sleep_sec = max(5, SCAN_INTERVAL_SEC - int(elapsed))
+        print(f"[스캔 종료] 소요 {elapsed:.1f}s / 다음 스캔 {sleep_sec}s 후")
         time.sleep(sleep_sec)
 
+
 if __name__ == "__main__":
-    main_loop()
+    main()
